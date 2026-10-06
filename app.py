@@ -86,7 +86,7 @@ def get_marker_corners(img):
 
 # --- 3. メイン画面制御 ---
 if check_password():
-    st.title("🔍 刻印・図案 差分解析システム")
+    st.title("🔍 刻印図案解析システム")
 
     col1, col2 = st.columns(2)
     with col1:
