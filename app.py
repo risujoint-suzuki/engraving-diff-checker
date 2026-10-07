@@ -10,8 +10,7 @@ st.set_page_config(page_title="刻印画像解析システム", layout="wide")
 # --- 1. パスワード認証機能 ---
 def check_password():
     def password_entered():
-        # 【重要】運用時は任意のパスワードに変更してください
-        if st.session_state["password"] == "G7k2M9xP":
+        if st.session_state["password"] == "SecretPass123!":
             st.session_state["password_correct"] = True
             del st.session_state["password"]
         else:
@@ -37,7 +36,7 @@ def check_password():
     return True
 
 
-# --- 2. 画像解析処理ロジック ---
+# --- 2. PDF処理ロジック ---
 def process_pdf(pdf_bytes):
     """PDFをメモリ上で画像化"""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -53,40 +52,60 @@ def process_pdf(pdf_bytes):
     return img
 
 
-def get_marker_corners(img):
-    """ArUcoマーカー(4箇所)の検出"""
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-    parameters = cv2.aruco.DetectorParameters()
-    detector = cv2.aruco.ArucoDetector(dictionary, parameters)
-    corners, ids, _ = detector.detectMarkers(img)
+# --- 3. ORB特徴点マッチングによる自動位置合わせ ---
+def align_images_orb(img_pdf, img_photo, max_features=5000):
+    """マーカーなしで2枚の画像の位置・角度・スケールを揃える"""
+    gray_pdf = cv2.cvtColor(img_pdf, cv2.COLOR_BGR2GRAY)
+    gray_photo = cv2.cvtColor(img_photo, cv2.COLOR_BGR2GRAY)
 
-    if ids is None or len(ids) < 4:
-        return None
+    # ORB特徴点検出器の初期化
+    orb = cv2.ORB_create(nfeatures=max_features)
 
-    marker_centers = {}
-    for i, marker_id in enumerate(ids.flatten()):
-        c = corners[i][0]
-        marker_centers[marker_id] = c.mean(axis=0)
+    # 特徴点と特徴量の抽出
+    kp_pdf, des_pdf = orb.detectAndCompute(gray_pdf, None)
+    kp_photo, des_photo = orb.detectAndCompute(gray_photo, None)
 
-    # ID 0, 1, 2, 3 の順で取得
-    try:
-        pts = np.array(
-            [
-                marker_centers[0],
-                marker_centers[1],
-                marker_centers[2],
-                marker_centers[3],
-            ],
-            dtype=np.float32,
+    if des_pdf is None or des_photo is None:
+        return None, "特徴点が検出できませんでした。"
+
+    # マッチング器（BFMatcher）で特徴点を接続
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = matcher.match(des_pdf, des_photo)
+
+    # 距離の近い（一致度の高い）上位マッチング点を抽出
+    matches = sorted(matches, key=lambda x: x.distance)
+    good_matches = matches[: int(len(matches) * 0.2)]  # 上位20%を使用
+
+    if len(good_matches) < 4:
+        return (
+            None,
+            "十分な一致点が見つかりませんでした。撮影画像が不鮮明か、角度がつきすぎています。",
         )
-        return pts
-    except KeyError:
-        return None
+
+    # 特徴点の座標配列を作成
+    pts_pdf = np.float32([kp_pdf[m.queryIdx].pt for m in good_matches]).reshape(
+        -1, 1, 2
+    )
+    pts_photo = np.float32(
+        [kp_photo[m.trainIdx].pt for m in good_matches]
+    ).reshape(-1, 1, 2)
+
+    # ホモグラフィ行列（幾何補正行列）を算出 (RANSACで外れ値を除外)
+    H, mask = cv2.findHomography(pts_photo, pts_pdf, cv2.RANSAC, 5.0)
+
+    if H is None:
+        return None, "幾何補正の計算に失敗しました。"
+
+    # 撮影画像をPDFのサイズ・視点に合わせて射影変換
+    h, w = img_pdf.shape[:2]
+    aligned_photo = cv2.warpPerspective(img_photo, H, (w, h))
+
+    return aligned_photo, None
 
 
-# --- 3. メイン画面制御 ---
+# --- 4. メイン画面制御 ---
 if check_password():
-    st.title("🔍 刻印図案解析システム")
+    st.title("🔍 刻印・図案 差分解析システム (ORB自動補正版)")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -98,27 +117,21 @@ if check_password():
 
     if pdf_file and photo_file:
         if st.button("解析実行", type="primary"):
-            # メモリ上でバイナリ読み込み（ディスク非保存）
+            # メモリ上でバイナリ読み込み
             pdf_bytes = pdf_file.read()
             pdf_img = process_pdf(pdf_bytes)
 
             file_bytes = np.frombuffer(photo_file.read(), dtype=np.uint8)
             photo_img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-            # マーカー検出
-            pdf_pts = get_marker_corners(pdf_img)
-            photo_pts = get_marker_corners(photo_img)
+            st.info("ORB特徴点による自動位置合わせを実施中...")
 
-            if pdf_pts is None or photo_pts is None:
-                st.error(
-                    "エラー: ArUcoマーカー（ID 0〜3の4箇所）が検出できませんでした。撮影画像またはPDFを確認してください。"
-                )
+            # ORBによる位置合わせ
+            aligned_photo, error_msg = align_images_orb(pdf_img, photo_img)
+
+            if aligned_photo is None:
+                st.error(f"エラー: {error_msg}")
             else:
-                # 射影変換（位置・スケール・傾き補正）
-                H, _ = cv2.findHomography(photo_pts, pdf_pts)
-                h, w = pdf_img.shape[:2]
-                aligned_photo = cv2.warpPerspective(photo_img, H, (w, h))
-
                 # グレースケール変換とSSIM比較
                 gray_pdf = cv2.cvtColor(pdf_img, cv2.COLOR_BGR2GRAY)
                 gray_photo = cv2.cvtColor(aligned_photo, cv2.COLOR_BGR2GRAY)
@@ -126,6 +139,7 @@ if check_password():
                 score, diff = ssim(gray_pdf, gray_photo, full=True)
                 diff = (diff * 255).astype("uint8")
 
+                # 差分領域の抽出
                 thresh = cv2.threshold(
                     diff, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
                 )[1]
@@ -136,7 +150,7 @@ if check_password():
                 result = aligned_photo.copy()
                 diff_count = 0
                 for c in contours:
-                    if cv2.contourArea(c) > 50:  # 微小ノイズ除外
+                    if cv2.contourArea(c) > 50:  # ノイズ除外閾値
                         x, y, w_box, h_box = cv2.boundingRect(c)
                         cv2.rectangle(
                             result,
@@ -150,7 +164,7 @@ if check_password():
                 # 結果表示
                 st.subheader("解析結果")
                 if diff_count == 0:
-                    st.success("判定: 一致（相相違点は検出されませんでした）")
+                    st.success("判定: 一致（相違点は検出されませんでした）")
                 else:
                     st.warning(
                         f"判定: 不一致（{diff_count} 箇所の相違点を検出）"
@@ -158,6 +172,6 @@ if check_password():
 
                 st.image(
                     cv2.cvtColor(result, cv2.COLOR_BGR2RGB),
-                    caption="解析結果画像 (差分箇所を赤枠で表示)",
+                    caption="解析結果画像 (自動補正済・差分箇所を赤枠で表示)",
                     use_container_width=True,
                 )
