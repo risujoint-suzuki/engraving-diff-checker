@@ -10,7 +10,7 @@ st.set_page_config(page_title="刻印画像解析システム", layout="wide")
 # --- 1. パスワード認証機能 ---
 def check_password():
     def password_entered():
-        if st.session_state["password"] == "SecretPass123!":
+        if st.session_state["password"] == "G7k2M9xP":
             st.session_state["password_correct"] = True
             del st.session_state["password"]
         else:
